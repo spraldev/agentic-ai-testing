@@ -57,13 +57,13 @@ const ARBITER_MODEL: ModelConfig = MODELS[2] // Use Gemini as arbiter
 
 const R1_SYSTEM_PROMPT = `You are an AI assistant solving a problem independently.
 
-1. Think step-by-step to reach an answer.
+1. Think step-by-step to reach an answer (be CONCISE - 2-3 sentences max).
 2. Write your reasoning in a block labeled REASONING:
 3. Then write a single final answer on one line labeled FINAL_ANSWER:
 
 Use this output format exactly:
 
-REASONING: <your detailed reasoning here>
+REASONING: <your concise reasoning (2-3 sentences)>
 
 FINAL_ANSWER: <your one-line final answer here>`
 
@@ -75,38 +75,36 @@ You will see:
 - ANSWERS_FROM_OTHERS
 
 Your job:
-1. Critique where the answers differ. Point out specific mistakes or weaknesses.
-2. Decide what YOU now believe is the best final answer.
+1. Briefly critique where answers differ (1-2 sentences max).
+2. Decide the best final answer.
 3. Update your answer if needed.
 
 Use this exact output format:
 
 CRITIQUE:
-<your critique of the different answers, refer to them by model id>
+<brief critique (1-2 sentences), refer to models by id>
 
 UPDATED_FINAL_ANSWER: <your one-line final answer after considering the debate>
 
-Do NOT invent new questions. Only answer the given question.`
+Be CONCISE. Do NOT invent new questions.`
 
 const R3_SYSTEM_PROMPT = `You are an arbiter reading the results of a multi-model debate.
 
-You will see the QUESTION and multiple candidate answers from different models from two rounds:
-- Round 1: independent answers
-- Round 2: critiques and updated answers
+You will see the QUESTION and candidate answers from 3 models across 2 rounds.
 
 Your job:
-1. Carefully read the question and all candidate final answers (especially the UPDATED_FINAL_ANSWER from each model in Round 2).
-2. Decide which final answer is most likely to be correct and well-justified.
-3. If two or more models give essentially the same correct answer, you may synthesize their reasoning into a single explanation.
+1. Review all UPDATED_FINAL_ANSWER values from Round 2.
+2. Choose the most correct answer.
+3. Synthesize if models agree.
 
 Output format:
 
 FINAL_ANSWER: <your one-line final answer>
 
 RATIONALE:
-<2-5 sentences explaining why you chose this answer, referencing specific model ids and arguments>
+<1-2 sentences explaining your choice, reference model ids>
 
-If you believe none of the answers are reliable, still choose the least-bad answer and explain the remaining uncertainty.`
+Be CONCISE. Choose the best answer even if uncertain.`
 
 // ============================================================================
 // Text Parsing Utilities
@@ -152,14 +150,15 @@ async function callLLM(
     anthropic: Anthropic
     openai: OpenAI
     genAI: GoogleGenerativeAI
-  }
+  },
+  maxTokens: number = 512
 ): Promise<string> {
   try {
     switch (config.provider) {
       case 'anthropic': {
         const response = await clients.anthropic.messages.create({
           model: config.modelName,
-          max_tokens: 2048,
+          max_tokens: maxTokens,
           messages: [
             {
               role: 'user',
@@ -173,7 +172,7 @@ async function callLLM(
       case 'openai': {
         const response = await clients.openai.chat.completions.create({
           model: config.modelName,
-          max_tokens: 2048,
+          max_tokens: maxTokens,
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt }
@@ -185,7 +184,10 @@ async function callLLM(
       case 'google': {
         const model = clients.genAI.getGenerativeModel({
           model: config.modelName,
-          systemInstruction: systemPrompt
+          systemInstruction: systemPrompt,
+          generationConfig: {
+            maxOutputTokens: maxTokens
+          }
         })
         const result = await model.generateContent(userPrompt)
         return result.response.text()
@@ -247,11 +249,14 @@ function buildRound2UserPrompt(
   self: Round1Answer,
   others: Round1Answer[]
 ): string {
+  // Truncate reasoning to 300 chars max to speed up processing
+  const truncate = (text: string) => text.substring(0, 300) + (text.length > 300 ? '...' : '')
+
   const othersText = others
     .map(
       (o) => `ANSWER_FROM_${o.modelId}:
 REASONING:
-${o.reasoning}
+${truncate(o.reasoning)}
 
 FINAL_ANSWER:
 ${o.finalAnswer}`
@@ -263,7 +268,7 @@ ${question}
 
 YOUR_PREVIOUS_ANSWER (${self.modelId}):
 REASONING:
-${self.reasoning}
+${truncate(self.reasoning)}
 
 FINAL_ANSWER:
 ${self.finalAnswer}
@@ -317,6 +322,9 @@ function buildArbiterPrompt(
   round1: Round1Answer[],
   round2: Round2Critique[]
 ): string {
+  // Truncate text to 200 chars max to speed up arbiter processing
+  const truncate = (text: string) => text.substring(0, 200) + (text.length > 200 ? '...' : '')
+
   let text = `QUESTION:
 ${question}
 
@@ -329,7 +337,7 @@ MODEL: ${r1.modelId}
 FINAL_ANSWER:
 ${r1.finalAnswer}
 REASONING:
-${r1.reasoning}
+${truncate(r1.reasoning)}
 `
   }
 
@@ -344,7 +352,7 @@ MODEL: ${r2.modelId}
 UPDATED_FINAL_ANSWER:
 ${r2.revisedAnswer}
 CRITIQUE:
-${r2.critique}
+${truncate(r2.critique)}
 `
   }
 
@@ -363,7 +371,7 @@ async function runRound3(
 ): Promise<{ finalAnswer: string; rationale: string }> {
   const arbiterPrompt = buildArbiterPrompt(question, round1, round2)
 
-  const responseText = await callLLM(ARBITER_MODEL, R3_SYSTEM_PROMPT, arbiterPrompt, clients)
+  const responseText = await callLLM(ARBITER_MODEL, R3_SYSTEM_PROMPT, arbiterPrompt, clients, 768)
 
   const finalAnswer = extractAfter(responseText, 'FINAL_ANSWER:')
   const rationale = extractAfter(responseText, 'RATIONALE:')
