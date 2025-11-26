@@ -55,56 +55,218 @@ const ARBITER_MODEL: ModelConfig = MODELS[0] // Use Claude as arbiter (more reli
 // Prompt Templates
 // ============================================================================
 
-const R1_SYSTEM_PROMPT = `You are an AI assistant solving a problem independently.
+const R1_SYSTEM_PROMPT = `Solve this task. Quality and correctness matter more than speed.
 
-1. Think step-by-step to reach an answer. Be as detailed as needed - for simple questions be concise, for complex problems (like coding challenges) provide full explanations and complete implementations.
-2. Write your reasoning in a block labeled REASONING:
-3. Then write a final answer labeled FINAL_ANSWER:
+STEP 1 - UNDERSTAND BEFORE STARTING:
+• Restate what's being asked in your own words
+• If examples/test cases exist: work through Example 1 BY HAND first and explain why it produces that output
+• If no examples exist: create a simple test case yourself to verify your understanding
+• What makes this tricky? What could go wrong?
 
-Use this output format exactly:
+STEP 2 - PLAN, THEN EXECUTE:
+Outline your approach briefly:
+• For code: algorithm, data structures, time complexity
+• For math: technique, formulas, key steps
+• For writing: thesis/main argument and 3-4 supporting points
+• For analysis: framework, criteria, structure
 
-REASONING: <your detailed reasoning - include full code implementations if needed>
+Then execute fully with clear reasoning shown.
 
-FINAL_ANSWER: <your final answer - can be multi-line for code>`
+STEP 3 - VERIFY YOUR WORK:
+You MUST check your answer before finalizing.
 
-const R2_SYSTEM_PROMPT = `You are participating in a multi-model debate.
+For CODE:
+→ Trace through Example 1 step-by-step, showing variable values at each line
+→ Does your output match expected? If NO: stop, find the bug, fix it, re-verify
+→ CRITICAL: If you sorted any array, did you keep related data paired with it?
 
-You will see:
-- The original QUESTION
-- YOUR_PREVIOUS_ANSWER
-- ANSWERS_FROM_OTHERS
+For MATH:
+→ Redo key calculations to double-check arithmetic
+→ Do units/dimensions make sense? Is the magnitude reasonable?
+→ If data was reordered, did you maintain necessary pairings?
 
-Your job:
-1. Critique where answers differ. Point out specific mistakes or improvements. Be detailed for complex problems.
-2. Decide the best final answer.
-3. Update your answer if needed. For coding problems, provide the complete corrected implementation.
+For WRITING/ANALYSIS:
+→ Read the first sentence of each paragraph in sequence — do they tell a logical story?
+→ Does every paragraph support your main thesis/argument?
+→ Is every claim backed by evidence, example, or reasoning?
 
-Use this exact output format:
+For ALL TASKS:
+→ Did you actually answer what was asked, or did you drift?
 
-CRITIQUE:
-<your detailed critique, refer to models by id>
+STEP 4 - STRESS TEST:
+Assume your answer has a flaw. Try to find it:
+• What's the weakest part?
+• What would a critic attack?
+• For code/math: test an edge case (n=0, n=1, negative values, huge values)
+• For writing: what would someone who disagrees say? Is it addressed?
 
-UPDATED_FINAL_ANSWER: <your final answer - can be multi-line for code>
+If you find a problem → fix it before finalizing.
 
-Do NOT invent new questions.`
+OUTPUT FORMAT:
+UNDERSTANDING: [Task restated + Example 1 traced by hand (or your own test case) + what makes it tricky]
+APPROACH: [Your plan]
+SOLUTION: [Complete answer with reasoning shown]
+VERIFICATION: [What you checked + trace/evidence + results]
+FINAL_ANSWER: [Your final answer]
+CONFIDENCE: [High / Medium / Low — with brief explanation of uncertainties]`
 
-const R3_SYSTEM_PROMPT = `You are an arbiter reading the results of a multi-model debate.
+const R2_SYSTEM_PROMPT = `You are reviewing solutions for correctness. You will see:
+• The original task
+• Your Round 1 answer
+• Other models' Round 1 answers (if available — some may have failed)
 
-You will see the QUESTION and candidate answers from 3 models across 2 rounds.
+YOUR GOAL: Find the correct answer. Do not assume any solution is right — including your own.
 
-Your job:
-1. Review all UPDATED_FINAL_ANSWER values from Round 2.
-2. Choose the most correct answer or synthesize the best elements from multiple answers.
-3. For coding problems, provide the complete, working implementation.
+⚠️ CRITICAL WARNING: Agreement does NOT mean correctness. If all solutions agree, be EXTRA skeptical — they might all share the same blind spot. This is common and dangerous.
 
-Output format:
+STEP 1 - HANDLE MISSING/FAILED SOLUTIONS:
+If any model failed to produce an answer (API error, refusal, "no answer provided"), note it and ignore that model. Work with what you have.
 
-FINAL_ANSWER: <your final answer - can be multi-line for code>
+STEP 2 - TEST EACH SOLUTION:
+For each available solution, verify it independently. Show your work.
 
-RATIONALE:
-<detailed explanation of your choice, reference model ids and specific improvements>
+For CODE:
+→ Trace through Example 1 line by line, showing variable values
+→ Does output match expected? Mark: ✓ PASS or ✗ FAIL
+→ CRITICAL: If any array was sorted, did related data stay paired with it?
 
-Choose the best answer even if uncertain.`
+For MATH:
+→ Redo the key calculations yourself
+→ Does your result match theirs? Mark: ✓ PASS or ✗ FAIL
+→ Check: If data was reordered, are pairings preserved?
+
+For WRITING/ANALYSIS:
+→ State the thesis/main argument in one sentence
+→ Does every paragraph support it? Is each claim evidenced?
+→ Mark: ✓ SOUND or ✗ FLAWED (state why)
+
+For ALL:
+→ Does it actually answer what was asked?
+
+STEP 3 - TRY TO BREAK EACH SOLUTION:
+Even if a solution passed Step 2, actively try to find a flaw:
+• What edge case might fail? (n=0, n=1, negatives, huge values)
+• What's the weakest assumption or argument?
+• Can you construct a specific input or counterargument that breaks it?
+
+STEP 4 - CHECK FOR SHARED BLIND SPOTS:
+If solutions AGREE:
+→ This is suspicious. Ask: "What could we ALL be getting wrong?"
+→ Re-examine the shared core logic independently
+→ Verify shared assumptions explicitly — don't just accept them
+
+If solutions DISAGREE:
+→ Identify the exact point of disagreement
+→ Test that specific point to determine who's right
+
+STEP 5 - REVIEW CONFIDENCE SIGNALS:
+Look at the confidence levels from Round 1:
+• If one model said "High confidence" and another said "Low confidence," weigh the high-confidence answer more — but still verify it
+• If a model expressed specific uncertainties, check if those concerns are valid
+
+STEP 6 - DELIVER VERDICT:
+Choose one:
+a) One solution is clearly correct → select it, explain why
+b) Multiple are correct → pick the best reasoned/cleanest
+c) All are flawed → identify the error and provide a corrected answer with work shown
+d) Genuinely uncertain → state what's unresolved
+
+OUTPUT FORMAT:
+SOLUTIONS_REVIEWED: [List which models you're evaluating, note any that failed/were ignored]
+VERIFICATION: [For each solution: your trace/analysis + ✓/✗ verdict with reasoning]
+BREAK_ATTEMPTS: [Edge cases, counterarguments, and adversarial inputs you tested]
+BLIND_SPOT_CHECK: [If solutions agreed: what might they all be missing? What did you verify? If they disagreed: who's right on the disputed point?]
+CRITIQUE: [Summary: what's right, what's wrong, who you trust and why]
+UPDATED_FINAL_ANSWER: [The correct answer — either selected or corrected]
+CONFIDENCE: [High / Medium / Low — and what remains uncertain]`
+
+const R3_SYSTEM_PROMPT = `You are the final judge. Your ruling is final. You will see:
+• The original task
+• All Round 1 solutions
+• All Round 2 critiques and revised answers
+
+YOUR MISSION: Deliver the correct answer. No one reviews your work — get it right.
+
+⚠️ JUDGING PRINCIPLES:
+
+1. VERIFICATION BEATS VOTING
+   If 3 models agree but your verification shows they're wrong, they're wrong.
+   Do not be swayed by consensus. Trust your own verification.
+
+2. AGREEMENT IS STILL SUSPICIOUS
+   If everyone converged on the same answer after Round 2, they may still share a blind spot.
+   Verify the consensus answer just as rigorously as disputed ones.
+
+3. JUDGE FLIP-FLOPPERS CAREFULLY
+   If a model changed their answer R1→R2, examine why:
+   • GOOD change: A real bug/flaw was identified with clear reasoning → trust the new answer
+   • BAD change: Model just agreed with others without real justification → this is sycophancy, discount this model's input
+
+4. IGNORE NON-ANSWERS
+   If any model failed to produce an answer (API error, refusal, etc.), disregard it entirely.
+
+5. USE CONFIDENCE SIGNALS
+   Pay attention to confidence levels from earlier rounds. A model that said "Low confidence" and was later proven wrong is less surprising than one that said "High confidence" and failed.
+
+6. YOU MUST VERIFY BEFORE RULING
+   Never output a final answer you haven't personally verified.
+
+STEP 1 - SURVEY:
+Quickly assess:
+• How many distinct candidate answers exist?
+• Who agrees with whom?
+• Who changed their answer R1→R2? Was it justified with real reasoning?
+• What confidence levels were claimed?
+• Any models that failed to answer? (Ignore them)
+
+STEP 2 - VERIFY EACH CANDIDATE:
+For each distinct proposed answer, test it yourself:
+
+For CODE:
+→ Trace Example 1 step-by-step, showing variable values at each line
+→ Compare your output to expected output
+→ CRITICAL: If any arrays were sorted, verify related data stayed paired
+→ Test one edge case (n=0, n=1, negatives, large values)
+
+For MATH:
+→ Redo the key calculations yourself
+→ Check magnitudes, signs, units
+→ If data was reordered at any point, verify pairings preserved
+
+For WRITING/ANALYSIS:
+→ State the core thesis in one sentence
+→ Does each paragraph support it? Is each claim backed by evidence?
+→ What's the strongest counterargument? Is it addressed?
+
+For ALL TASKS:
+→ Does this actually answer what was asked?
+
+Mark each candidate: ✓ VERIFIED or ✗ FAILED (state specific reason)
+
+STEP 3 - RULE:
+Based on your verification:
+• One candidate verified, others failed → Select the verified one
+• Multiple candidates verified → Select the best-reasoned or most complete
+• ALL candidates failed → Construct the correct answer yourself with full work shown
+• Genuinely uncertain → State what's unresolved, give your best judgment with caveats
+
+STEP 4 - FINAL CHECK:
+Before submitting, verify your final answer one more time:
+→ Code: Trace Example 1. Does output match expected?
+→ Math: Redo the key calculation. Does it hold?
+→ Writing: Read paragraph first-sentences in sequence. Is the thesis supported?
+
+If this check fails → return to Step 3 and fix.
+
+OUTPUT FORMAT:
+ANALYSIS:
+[Summary: What candidates exist, who agreed/disagreed, who flipped (and whether justified), your verification result for each candidate with ✓/✗ and reasoning]
+
+FINAL_ANSWER:
+[The complete, correct answer]
+
+JUSTIFICATION:
+[Why this answer is correct — include your verification trace as proof. Why alternatives were rejected. Your confidence level (High/Medium/Low) and any remaining uncertainties.]`
 
 // ============================================================================
 // Text Parsing Utilities
@@ -133,7 +295,12 @@ function extractAfter(text: string, marker: string): string {
 
   // For multi-line content (like code), extract everything until the next marker or end
   // Look for common markers that might come after
-  const nextMarkers = ['\n\nRATIONALE:', '\n\nREASONING:', '\n\nFINAL_ANSWER:', '\n\nCRITIQUE:', '\n\nUPDATED_FINAL_ANSWER:']
+  const nextMarkers = [
+    '\n\nRATIONALE:', '\n\nREASONING:', '\n\nFINAL_ANSWER:', '\n\nCRITIQUE:', '\n\nUPDATED_FINAL_ANSWER:',
+    '\n\nJUSTIFICATION:', '\n\nANALYSIS:', '\n\nUNDERSTANDING:', '\n\nAPPROACH:', '\n\nSOLUTION:',
+    '\n\nVERIFICATION:', '\n\nCONFIDENCE:', '\n\nSOLUTIONS_REVIEWED:', '\n\nBREAK_ATTEMPTS:',
+    '\n\nBLIND_SPOT_CHECK:'
+  ]
   let endIdx = restOfText.length
 
   for (const nextMarker of nextMarkers) {
@@ -416,7 +583,11 @@ async function runRound3(
   const responseText = await callLLM(ARBITER_MODEL, R3_SYSTEM_PROMPT, arbiterPrompt, clients, 8192)
 
   const finalAnswer = extractAfter(responseText, 'FINAL_ANSWER:')
-  const rationale = extractAfter(responseText, 'RATIONALE:')
+  // Try JUSTIFICATION first (new format), fall back to RATIONALE (old format)
+  let rationale = extractAfter(responseText, 'JUSTIFICATION:')
+  if (!rationale) {
+    rationale = extractAfter(responseText, 'RATIONALE:')
+  }
 
   console.log('Round 3 - Arbiter:', {
     finalAnswer,
