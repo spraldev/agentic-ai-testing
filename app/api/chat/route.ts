@@ -49,7 +49,7 @@ const MODELS: ModelConfig[] = [
   { id: 'gemini', provider: 'google', modelName: 'gemini-2.5-flash' }
 ]
 
-const ARBITER_MODEL: ModelConfig = MODELS[2] // Use Gemini as arbiter
+const ARBITER_MODEL: ModelConfig = MODELS[0] // Use Claude as arbiter (more reliable)
 
 // ============================================================================
 // Prompt Templates
@@ -57,15 +57,15 @@ const ARBITER_MODEL: ModelConfig = MODELS[2] // Use Gemini as arbiter
 
 const R1_SYSTEM_PROMPT = `You are an AI assistant solving a problem independently.
 
-1. Think step-by-step to reach an answer (be CONCISE - 2-3 sentences max).
+1. Think step-by-step to reach an answer. Be as detailed as needed - for simple questions be concise, for complex problems (like coding challenges) provide full explanations and complete implementations.
 2. Write your reasoning in a block labeled REASONING:
-3. Then write a single final answer on one line labeled FINAL_ANSWER:
+3. Then write a final answer labeled FINAL_ANSWER:
 
 Use this output format exactly:
 
-REASONING: <your concise reasoning (2-3 sentences)>
+REASONING: <your detailed reasoning - include full code implementations if needed>
 
-FINAL_ANSWER: <your one-line final answer here>`
+FINAL_ANSWER: <your final answer - can be multi-line for code>`
 
 const R2_SYSTEM_PROMPT = `You are participating in a multi-model debate.
 
@@ -75,18 +75,18 @@ You will see:
 - ANSWERS_FROM_OTHERS
 
 Your job:
-1. Briefly critique where answers differ (1-2 sentences max).
+1. Critique where answers differ. Point out specific mistakes or improvements. Be detailed for complex problems.
 2. Decide the best final answer.
-3. Update your answer if needed.
+3. Update your answer if needed. For coding problems, provide the complete corrected implementation.
 
 Use this exact output format:
 
 CRITIQUE:
-<brief critique (1-2 sentences), refer to models by id>
+<your detailed critique, refer to models by id>
 
-UPDATED_FINAL_ANSWER: <your one-line final answer after considering the debate>
+UPDATED_FINAL_ANSWER: <your final answer - can be multi-line for code>
 
-Be CONCISE. Do NOT invent new questions.`
+Do NOT invent new questions.`
 
 const R3_SYSTEM_PROMPT = `You are an arbiter reading the results of a multi-model debate.
 
@@ -94,17 +94,17 @@ You will see the QUESTION and candidate answers from 3 models across 2 rounds.
 
 Your job:
 1. Review all UPDATED_FINAL_ANSWER values from Round 2.
-2. Choose the most correct answer.
-3. Synthesize if models agree.
+2. Choose the most correct answer or synthesize the best elements from multiple answers.
+3. For coding problems, provide the complete, working implementation.
 
 Output format:
 
-FINAL_ANSWER: <your one-line final answer>
+FINAL_ANSWER: <your final answer - can be multi-line for code>
 
 RATIONALE:
-<1-2 sentences explaining your choice, reference model ids>
+<detailed explanation of your choice, reference model ids and specific improvements>
 
-Be CONCISE. Choose the best answer even if uncertain.`
+Choose the best answer even if uncertain.`
 
 // ============================================================================
 // Text Parsing Utilities
@@ -131,11 +131,19 @@ function extractAfter(text: string, marker: string): string {
   const contentStart = idx + marker.length
   const restOfText = text.substring(contentStart).trim()
 
-  // Extract only the first line for single-line answers
-  const firstLineEnd = restOfText.indexOf('\n')
-  if (firstLineEnd === -1) return restOfText
+  // For multi-line content (like code), extract everything until the next marker or end
+  // Look for common markers that might come after
+  const nextMarkers = ['\n\nRATIONALE:', '\n\nREASONING:', '\n\nFINAL_ANSWER:', '\n\nCRITIQUE:', '\n\nUPDATED_FINAL_ANSWER:']
+  let endIdx = restOfText.length
 
-  return restOfText.substring(0, firstLineEnd).trim()
+  for (const nextMarker of nextMarkers) {
+    const markerIdx = restOfText.indexOf(nextMarker)
+    if (markerIdx !== -1 && markerIdx < endIdx) {
+      endIdx = markerIdx
+    }
+  }
+
+  return restOfText.substring(0, endIdx).trim()
 }
 
 // ============================================================================
@@ -151,14 +159,26 @@ async function callLLM(
     openai: OpenAI
     genAI: GoogleGenerativeAI
   },
-  maxTokens: number = 512
+  maxTokens: number = 8192
 ): Promise<string> {
   try {
+    // Cap max tokens based on model limits
+    const getMaxTokensForProvider = (provider: string, requested: number): number => {
+      const limits: Record<string, number> = {
+        'openai': 4096,    // GPT-3.5-turbo max
+        'anthropic': 4096, // Claude 3 Haiku max
+        'google': 8192     // Gemini 2.5 Flash max
+      }
+      return Math.min(requested, limits[provider] || 4096)
+    }
+
+    const cappedMaxTokens = getMaxTokensForProvider(config.provider, maxTokens)
+
     switch (config.provider) {
       case 'anthropic': {
         const response = await clients.anthropic.messages.create({
           model: config.modelName,
-          max_tokens: maxTokens,
+          max_tokens: cappedMaxTokens,
           messages: [
             {
               role: 'user',
@@ -172,7 +192,7 @@ async function callLLM(
       case 'openai': {
         const response = await clients.openai.chat.completions.create({
           model: config.modelName,
-          max_tokens: maxTokens,
+          max_tokens: cappedMaxTokens,
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt }
@@ -186,11 +206,31 @@ async function callLLM(
           model: config.modelName,
           systemInstruction: systemPrompt,
           generationConfig: {
-            maxOutputTokens: maxTokens
+            maxOutputTokens: cappedMaxTokens
           }
         })
         const result = await model.generateContent(userPrompt)
-        return result.response.text()
+
+        // Check for safety filter blocks or incomplete responses
+        const response = result.response
+        const candidate = response.candidates?.[0]
+
+        if (candidate?.finishReason === 'MAX_TOKENS') {
+          console.warn(`Gemini hit MAX_TOKENS limit. Increase maxTokens if needed.`)
+        }
+
+        try {
+          const text = response.text()
+          if (!text || text.trim() === '') {
+            console.warn(`Gemini returned empty response. Candidates:`, response.candidates)
+            console.warn(`Prompt feedback:`, response.promptFeedback)
+            return 'REASONING: Unable to generate response due to safety filters or API limitations.\n\nFINAL_ANSWER: No answer provided\n\nCRITIQUE: Unable to provide critique due to API error.\n\nUPDATED_FINAL_ANSWER: No answer provided'
+          }
+          return text
+        } catch (e) {
+          console.warn(`Gemini response.text() failed:`, e)
+          return 'REASONING: Unable to generate response due to safety filters or API limitations.\n\nFINAL_ANSWER: No answer provided\n\nCRITIQUE: Unable to provide critique due to API error.\n\nUPDATED_FINAL_ANSWER: No answer provided'
+        }
       }
 
       default:
@@ -198,6 +238,14 @@ async function callLLM(
     }
   } catch (error) {
     console.error(`Error calling ${config.id}:`, error)
+
+    // For Gemini errors, return a fallback response instead of crashing
+    if (config.provider === 'google') {
+      console.warn(`Gemini failed, returning fallback response`)
+      // Return a response with all possible markers for different rounds
+      return 'REASONING: API call failed.\n\nFINAL_ANSWER: No answer provided\n\nCRITIQUE: Unable to provide critique due to API error.\n\nUPDATED_FINAL_ANSWER: No answer provided'
+    }
+
     throw error
   }
 }
@@ -249,14 +297,11 @@ function buildRound2UserPrompt(
   self: Round1Answer,
   others: Round1Answer[]
 ): string {
-  // Truncate reasoning to 300 chars max to speed up processing
-  const truncate = (text: string) => text.substring(0, 300) + (text.length > 300 ? '...' : '')
-
   const othersText = others
     .map(
       (o) => `ANSWER_FROM_${o.modelId}:
 REASONING:
-${truncate(o.reasoning)}
+${o.reasoning}
 
 FINAL_ANSWER:
 ${o.finalAnswer}`
@@ -268,7 +313,7 @@ ${question}
 
 YOUR_PREVIOUS_ANSWER (${self.modelId}):
 REASONING:
-${truncate(self.reasoning)}
+${self.reasoning}
 
 FINAL_ANSWER:
 ${self.finalAnswer}
@@ -322,9 +367,6 @@ function buildArbiterPrompt(
   round1: Round1Answer[],
   round2: Round2Critique[]
 ): string {
-  // Truncate text to 200 chars max to speed up arbiter processing
-  const truncate = (text: string) => text.substring(0, 200) + (text.length > 200 ? '...' : '')
-
   let text = `QUESTION:
 ${question}
 
@@ -337,7 +379,7 @@ MODEL: ${r1.modelId}
 FINAL_ANSWER:
 ${r1.finalAnswer}
 REASONING:
-${truncate(r1.reasoning)}
+${r1.reasoning}
 `
   }
 
@@ -352,7 +394,7 @@ MODEL: ${r2.modelId}
 UPDATED_FINAL_ANSWER:
 ${r2.revisedAnswer}
 CRITIQUE:
-${truncate(r2.critique)}
+${r2.critique}
 `
   }
 
@@ -371,7 +413,7 @@ async function runRound3(
 ): Promise<{ finalAnswer: string; rationale: string }> {
   const arbiterPrompt = buildArbiterPrompt(question, round1, round2)
 
-  const responseText = await callLLM(ARBITER_MODEL, R3_SYSTEM_PROMPT, arbiterPrompt, clients, 768)
+  const responseText = await callLLM(ARBITER_MODEL, R3_SYSTEM_PROMPT, arbiterPrompt, clients, 8192)
 
   const finalAnswer = extractAfter(responseText, 'FINAL_ANSWER:')
   const rationale = extractAfter(responseText, 'RATIONALE:')
