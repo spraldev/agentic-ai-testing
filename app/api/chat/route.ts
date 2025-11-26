@@ -4,205 +4,443 @@ import { GoogleGenerativeAI } from "@google/generative-ai"
 import OpenAI from "openai"
 import Anthropic from "@anthropic-ai/sdk"
 
-type Message = {
-  role: "user" | "assistant"
-  content: string
+// ============================================================================
+// Type Definitions
+// ============================================================================
+
+type ModelId = 'claude' | 'gpt' | 'gemini'
+
+interface ModelConfig {
+  id: ModelId
+  provider: 'openai' | 'anthropic' | 'google'
+  modelName: string
 }
+
+interface Round1Answer {
+  modelId: ModelId
+  rawAnswer: string
+  reasoning: string
+  finalAnswer: string
+}
+
+interface Round2Critique {
+  modelId: ModelId
+  rawCritique: string
+  critique: string
+  revisedAnswer: string
+}
+
+interface DebateResult {
+  question: string
+  round1: Round1Answer[]
+  round2: Round2Critique[]
+  finalAnswer: string
+  finalRationale: string
+  chosenFrom: ModelId[]
+}
+
+// ============================================================================
+// Model Configurations
+// ============================================================================
+
+const MODELS: ModelConfig[] = [
+  { id: 'claude', provider: 'anthropic', modelName: 'claude-3-haiku-20240307' },
+  { id: 'gpt', provider: 'openai', modelName: 'gpt-3.5-turbo' },
+  { id: 'gemini', provider: 'google', modelName: 'gemini-2.5-flash' }
+]
+
+const ARBITER_MODEL: ModelConfig = MODELS[2] // Use Gemini as arbiter
+
+// ============================================================================
+// Prompt Templates
+// ============================================================================
+
+const R1_SYSTEM_PROMPT = `You are an AI assistant solving a problem independently.
+
+1. Think step-by-step to reach an answer.
+2. Write your reasoning in a block labeled REASONING:
+3. Then write a single final answer on one line labeled FINAL_ANSWER:
+
+Use this output format exactly:
+
+REASONING: <your detailed reasoning here>
+
+FINAL_ANSWER: <your one-line final answer here>`
+
+const R2_SYSTEM_PROMPT = `You are participating in a multi-model debate.
+
+You will see:
+- The original QUESTION
+- YOUR_PREVIOUS_ANSWER
+- ANSWERS_FROM_OTHERS
+
+Your job:
+1. Critique where the answers differ. Point out specific mistakes or weaknesses.
+2. Decide what YOU now believe is the best final answer.
+3. Update your answer if needed.
+
+Use this exact output format:
+
+CRITIQUE:
+<your critique of the different answers, refer to them by model id>
+
+UPDATED_FINAL_ANSWER: <your one-line final answer after considering the debate>
+
+Do NOT invent new questions. Only answer the given question.`
+
+const R3_SYSTEM_PROMPT = `You are an arbiter reading the results of a multi-model debate.
+
+You will see the QUESTION and multiple candidate answers from different models from two rounds:
+- Round 1: independent answers
+- Round 2: critiques and updated answers
+
+Your job:
+1. Carefully read the question and all candidate final answers (especially the UPDATED_FINAL_ANSWER from each model in Round 2).
+2. Decide which final answer is most likely to be correct and well-justified.
+3. If two or more models give essentially the same correct answer, you may synthesize their reasoning into a single explanation.
+
+Output format:
+
+FINAL_ANSWER: <your one-line final answer>
+
+RATIONALE:
+<2-5 sentences explaining why you chose this answer, referencing specific model ids and arguments>
+
+If you believe none of the answers are reliable, still choose the least-bad answer and explain the remaining uncertainty.`
+
+// ============================================================================
+// Text Parsing Utilities
+// ============================================================================
+
+function extractBetween(text: string, startMarker: string, endMarker: string): string {
+  const startIdx = text.indexOf(startMarker)
+  if (startIdx === -1) return ''
+
+  const contentStart = startIdx + startMarker.length
+  const endIdx = text.indexOf(endMarker, contentStart)
+
+  if (endIdx === -1) {
+    return text.substring(contentStart).trim()
+  }
+
+  return text.substring(contentStart, endIdx).trim()
+}
+
+function extractAfter(text: string, marker: string): string {
+  const idx = text.indexOf(marker)
+  if (idx === -1) return ''
+
+  const contentStart = idx + marker.length
+  const restOfText = text.substring(contentStart).trim()
+
+  // Extract only the first line for single-line answers
+  const firstLineEnd = restOfText.indexOf('\n')
+  if (firstLineEnd === -1) return restOfText
+
+  return restOfText.substring(0, firstLineEnd).trim()
+}
+
+// ============================================================================
+// LLM Client Abstraction
+// ============================================================================
+
+async function callLLM(
+  config: ModelConfig,
+  systemPrompt: string,
+  userPrompt: string,
+  clients: {
+    anthropic: Anthropic
+    openai: OpenAI
+    genAI: GoogleGenerativeAI
+  }
+): Promise<string> {
+  try {
+    switch (config.provider) {
+      case 'anthropic': {
+        const response = await clients.anthropic.messages.create({
+          model: config.modelName,
+          max_tokens: 2048,
+          messages: [
+            {
+              role: 'user',
+              content: `${systemPrompt}\n\n${userPrompt}`
+            }
+          ]
+        })
+        return response.content[0].type === 'text' ? response.content[0].text : ''
+      }
+
+      case 'openai': {
+        const response = await clients.openai.chat.completions.create({
+          model: config.modelName,
+          max_tokens: 2048,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+          ]
+        })
+        return response.choices[0]?.message?.content || ''
+      }
+
+      case 'google': {
+        const model = clients.genAI.getGenerativeModel({
+          model: config.modelName,
+          systemInstruction: systemPrompt
+        })
+        const result = await model.generateContent(userPrompt)
+        return result.response.text()
+      }
+
+      default:
+        throw new Error(`Unknown provider: ${config.provider}`)
+    }
+  } catch (error) {
+    console.error(`Error calling ${config.id}:`, error)
+    throw error
+  }
+}
+
+// ============================================================================
+// Round 1: Independent Solutions (Parallel)
+// ============================================================================
+
+async function runRound1(
+  question: string,
+  clients: {
+    anthropic: Anthropic
+    openai: OpenAI
+    genAI: GoogleGenerativeAI
+  }
+): Promise<Round1Answer[]> {
+  const userPrompt = `QUESTION:\n${question}`
+
+  const results = await Promise.all(
+    MODELS.map(async (model) => {
+      const responseText = await callLLM(model, R1_SYSTEM_PROMPT, userPrompt, clients)
+
+      const reasoning = extractBetween(responseText, 'REASONING:', 'FINAL_ANSWER:')
+      const finalAnswer = extractAfter(responseText, 'FINAL_ANSWER:')
+
+      console.log(`Round 1 - ${model.id}:`, {
+        reasoning: reasoning.substring(0, 100) + '...',
+        finalAnswer
+      })
+
+      return {
+        modelId: model.id,
+        rawAnswer: responseText,
+        reasoning: reasoning || responseText, // fallback to full text if marker missing
+        finalAnswer: finalAnswer || 'No answer provided'
+      }
+    })
+  )
+
+  return results
+}
+
+// ============================================================================
+// Round 2: Critique & Revise (Parallel)
+// ============================================================================
+
+function buildRound2UserPrompt(
+  question: string,
+  self: Round1Answer,
+  others: Round1Answer[]
+): string {
+  const othersText = others
+    .map(
+      (o) => `ANSWER_FROM_${o.modelId}:
+REASONING:
+${o.reasoning}
+
+FINAL_ANSWER:
+${o.finalAnswer}`
+    )
+    .join('\n\n')
+
+  return `QUESTION:
+${question}
+
+YOUR_PREVIOUS_ANSWER (${self.modelId}):
+REASONING:
+${self.reasoning}
+
+FINAL_ANSWER:
+${self.finalAnswer}
+
+${othersText}`
+}
+
+async function runRound2(
+  question: string,
+  round1: Round1Answer[],
+  clients: {
+    anthropic: Anthropic
+    openai: OpenAI
+    genAI: GoogleGenerativeAI
+  }
+): Promise<Round2Critique[]> {
+  const results = await Promise.all(
+    round1.map(async (self) => {
+      const others = round1.filter((r) => r.modelId !== self.modelId)
+      const userPrompt = buildRound2UserPrompt(question, self, others)
+
+      const modelConfig = MODELS.find((m) => m.id === self.modelId)!
+      const responseText = await callLLM(modelConfig, R2_SYSTEM_PROMPT, userPrompt, clients)
+
+      const critique = extractBetween(responseText, 'CRITIQUE:', 'UPDATED_FINAL_ANSWER:')
+      const revisedAnswer = extractAfter(responseText, 'UPDATED_FINAL_ANSWER:')
+
+      console.log(`Round 2 - ${self.modelId}:`, {
+        critique: critique.substring(0, 100) + '...',
+        revisedAnswer
+      })
+
+      return {
+        modelId: self.modelId,
+        rawCritique: responseText,
+        critique: critique || responseText,
+        revisedAnswer: revisedAnswer || self.finalAnswer // fallback to R1 answer
+      }
+    })
+  )
+
+  return results
+}
+
+// ============================================================================
+// Round 3: Arbiter Synthesis
+// ============================================================================
+
+function buildArbiterPrompt(
+  question: string,
+  round1: Round1Answer[],
+  round2: Round2Critique[]
+): string {
+  let text = `QUESTION:
+${question}
+
+ROUND_1_ANSWERS:
+`
+
+  for (const r1 of round1) {
+    text += `
+MODEL: ${r1.modelId}
+FINAL_ANSWER:
+${r1.finalAnswer}
+REASONING:
+${r1.reasoning}
+`
+  }
+
+  text += `
+
+ROUND_2_UPDATED_ANSWERS:
+`
+
+  for (const r2 of round2) {
+    text += `
+MODEL: ${r2.modelId}
+UPDATED_FINAL_ANSWER:
+${r2.revisedAnswer}
+CRITIQUE:
+${r2.critique}
+`
+  }
+
+  return text
+}
+
+async function runRound3(
+  question: string,
+  round1: Round1Answer[],
+  round2: Round2Critique[],
+  clients: {
+    anthropic: Anthropic
+    openai: OpenAI
+    genAI: GoogleGenerativeAI
+  }
+): Promise<{ finalAnswer: string; rationale: string }> {
+  const arbiterPrompt = buildArbiterPrompt(question, round1, round2)
+
+  const responseText = await callLLM(ARBITER_MODEL, R3_SYSTEM_PROMPT, arbiterPrompt, clients)
+
+  const finalAnswer = extractAfter(responseText, 'FINAL_ANSWER:')
+  const rationale = extractAfter(responseText, 'RATIONALE:')
+
+  console.log('Round 3 - Arbiter:', {
+    finalAnswer,
+    rationale: rationale.substring(0, 100) + '...'
+  })
+
+  return {
+    finalAnswer: finalAnswer || 'Unable to determine final answer',
+    rationale: rationale || responseText
+  }
+}
+
+// ============================================================================
+// Main API Handler
+// ============================================================================
 
 export async function POST(req: NextRequest) {
   try {
-    const { messages } = (await req.json()) as { messages: Message[] }
+    const { question, debug } = (await req.json()) as { question: string; debug?: boolean }
 
-    if (!messages || messages.length === 0) {
-      return new Response("Messages are required", { status: 400 })
-    }
-
-    const lastMessage = messages[messages.length - 1]
-    if (!lastMessage || lastMessage.role !== "user") {
-      return new Response("Last message must be from user", { status: 400 })
+    if (!question || typeof question !== 'string') {
+      return new Response(JSON.stringify({ error: 'Missing or invalid question' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' }
+      })
     }
 
     // Initialize AI clients
-    const anthropic = new Anthropic({
-      apiKey: process.env.ANTHROPIC_API_KEY,
-    })
+    const clients = {
+      anthropic: new Anthropic({
+        apiKey: process.env.ANTHROPIC_API_KEY
+      }),
+      openai: new OpenAI({
+        apiKey: process.env.OPENAI_API_KEY
+      }),
+      genAI: new GoogleGenerativeAI(process.env.GOOGLE_API_KEY || '')
+    }
 
-    const openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    })
+    console.log('\n=== Starting Multi-Model Debate ===')
+    console.log('Question:', question)
 
-    const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY || "")
+    // Execute the three rounds
+    const round1 = await runRound1(question, clients)
+    const round2 = await runRound2(question, round1, clients)
+    const { finalAnswer, rationale } = await runRound3(question, round1, round2, clients)
 
-    const encoder = new TextEncoder()
-    const stream = new ReadableStream({
-      async start(controller) {
-        try {
-          const userMessage = lastMessage.content
+    const result: DebateResult = {
+      question,
+      round1,
+      round2,
+      finalAnswer,
+      finalRationale: rationale,
+      chosenFrom: round2.map((r) => r.modelId)
+    }
 
-          // AGENT 1: Initial Problem Solver
-          const claudeResponse = await anthropic.messages.create({
-            model: "claude-3-haiku-20240307",
-            max_tokens: 2048,
-            messages: [
-              {
-                role: "user",
-                content: `You are Agent 1 - the Initial Problem Solver in a multi-agent verification system.
+    console.log('=== Debate Complete ===\n')
 
-USER'S QUESTION:
-${userMessage}
-
-YOUR TASK:
-1. Break down the problem into clear steps
-2. Show ALL calculations explicitly with intermediate steps (e.g., "12,000 × 0.03 = 360, then 360 × 25 = 9,000")
-3. State all assumptions clearly
-4. If there are constraints, list them explicitly and check each one
-5. For numerical problems: write out EVERY calculation in full, don't skip steps
-6. If the problem involves multiple variables, create a clear structure (table/list) to track them
-7. Double-check your own arithmetic before finalizing
-
-CRITICAL: Your response will be verified by other agents, so accuracy is more important than speed. Show your work clearly so others can verify it.
-
-Provide your detailed solution:`
-              }
-            ],
-          })
-
-          const claudeText = claudeResponse.content[0].type === 'text'
-            ? claudeResponse.content[0].text
-            : ''
-
-          console.log("Agent 1 (Claude) response:", claudeText)
-
-          // AGENT 2: Fact Checker & Verifier
-          const gptResponse = await openai.chat.completions.create({
-            model: "gpt-3.5-turbo",
-            max_tokens: 2048,
-            messages: [
-              {
-                role: "user",
-                content: `You are Agent 2 - the Fact Checker & Verifier in a multi-agent verification system.
-
-USER'S ORIGINAL QUESTION:
-${userMessage}
-
-AGENT 1'S SOLUTION:
-${claudeText}
-
-YOUR CRITICAL VERIFICATION TASK:
-1. **VERIFY ALL CALCULATIONS**: Re-calculate every single number from scratch. Check:
-   - Basic arithmetic (addition, subtraction, multiplication, division)
-   - Order of operations
-   - Unit conversions
-   - Percentages and decimals
-   
-2. **CHECK LOGICAL CONSISTENCY**: 
-   - Does the solution actually answer the question asked?
-   - Are there any logical contradictions?
-   - Are all constraints from the problem satisfied?
-   
-3. **IDENTIFY ERRORS**:
-   - Mark each error with "❌ ERROR:" followed by explanation
-   - For calculation errors, show: "Agent 1 calculated X, but correct answer is Y"
-   - Note if Agent 1 misunderstood any constraints
-   
-4. **CONFIRM CORRECT PARTS**:
-   - Mark verified correct sections with "✓ VERIFIED:"
-   - This helps Agent 3 know what's trustworthy
-
-5. **ADD MISSING INFORMATION**:
-   - If Agent 1 missed important aspects, note them clearly
-
-FORMAT YOUR RESPONSE AS:
-## Verification Results
-
-### Errors Found
-[List all errors here, or write "No errors found"]
-
-### Verified Correct
-[List what you've verified as accurate]
-
-### Additional Notes
-[Any missing information or improvements]
-
-BE THOROUGH - catching errors now prevents them from propagating to the final answer.`
-              }
-            ],
-          })
-
-          const gptText = gptResponse.choices[0]?.message?.content || ''
-          console.log("Agent 2 (GPT-3.5) response:", gptText)
-
-          // AGENT 3: Final Synthesizer & Quality Controller
-          const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" })
-          const geminiResponse = await geminiModel.generateContent({
-            contents: [
-              {
-                role: "user",
-                parts: [
-                  {
-                    text: `You are Agent 3 - the Final Synthesizer & Quality Controller in a multi-agent verification system.
-
-USER'S ORIGINAL QUESTION:
-${userMessage}
-
-AGENT 1'S INITIAL SOLUTION:
-${claudeText}
-
-AGENT 2'S VERIFICATION & CORRECTIONS:
-${gptText}
-
-YOUR FINAL SYNTHESIS TASK:
-1. **INDEPENDENT VERIFICATION**: Before synthesizing, independently verify any calculations that Agent 2 flagged as errors. Don't just trust Agent 2 - verify the corrections yourself.
-
-2. **RESOLVE CONTRADICTIONS**:
-   - If Agent 1 and Agent 2 disagree, determine which is correct by recalculating
-   - Show your verification work
-   - If both are wrong, provide the correct answer with calculations
-
-3. **CREATE FINAL ANSWER**:
-   - Use only verified correct information
-   - Correct all identified errors
-   - Present a clean, accurate final response
-   - Include all necessary calculations clearly
-
-4. **FINAL QUALITY CHECKS**:
-   - Does the answer directly address the user's question?
-   - Are all numbers accurate and properly calculated?
-   - Are all constraints satisfied?
-   - Is anything still missing?
-
-5. **FLAG UNSOLVABLE PROBLEMS**: If the problem has no valid solution given the constraints, clearly state this rather than forcing an invalid answer.
-
-FORMAT:
-Start with a brief summary, then provide the complete verified answer. If you found errors in previous agents' work, briefly note what was corrected.
-
-REMEMBER: You are the last line of defense against errors. The user trusts this final response to be accurate.`
-                  }
-                ]
-              }
-            ]
-          })
-
-          const geminiText = geminiResponse.response.text()
-          controller.enqueue(encoder.encode(geminiText))
-
-          controller.close()
-        } catch (error) {
-          console.error("Multi-agent error:", error)
-          controller.enqueue(encoder.encode(`\n\nError: ${error instanceof Error ? error.message : 'Unknown error occurred'}`))
-          controller.close()
-        }
-      },
-    })
-
-    return new Response(stream, {
+    return new Response(JSON.stringify(result, null, debug ? 2 : 0), {
+      status: 200,
       headers: {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Transfer-Encoding": "chunked",
-      },
+        'Content-Type': 'application/json'
+      }
     })
   } catch (error) {
-    console.error("Chat API error:", error)
-    return new Response("Internal server error", { status: 500 })
+    console.error('Chat API error:', error)
+    return new Response(
+      JSON.stringify({
+        error: 'Internal server error',
+        message: error instanceof Error ? error.message : 'Unknown error'
+      }),
+      {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' }
+      }
+    )
   }
 }
